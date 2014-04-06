@@ -1,0 +1,36 @@
+# Contributor: Raymond Wanyoike <raymond.wanyoike@gmail.com>
+
+_pkgname='atomicparsley'
+
+pkgname=${_pkgname}-hg
+pkgver=r109.9183fff907bf
+pkgrel=1
+pkgdesc='A command line program for reading, parsing and setting iTunes-style metadata in MPEG4 files'
+arch=('i686' 'x86_64')
+url='https://bitbucket.org/wez/atomicparsley/'
+license=('GPL')
+makedepends=('mercurial zlib')
+provides=(${_pkgname})
+conflicts=(${_pkgname})
+source=("hg+https://bitbucket.org/wez/${_pkgname}/")
+md5sums=('SKIP')
+
+pkgver() {
+  cd ${srcdir}/${_pkgname}
+  #hg tip --template '{latesttag}\n' | sed 's/^v//;s/-/./g'
+  printf "r%s.%s" "$(hg identify -n)" "$(hg identify -i)"
+}
+
+build() {
+  cd ${srcdir}/${_pkgname}
+  ./autogen.sh
+  ./configure
+  make
+}
+
+package() {
+  cd ${srcdir}/${_pkgname}
+  install -D -m755 AtomicParsley ${pkgdir}/usr/bin/AtomicParsley || return 1
+}
+
+# vim:set ts=2 sw=2 et:

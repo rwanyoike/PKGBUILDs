@@ -1,4 +1,4 @@
-# Maintainer: Raymond Wanyoike <raymond dot wanyoike at gmail dot com>
+# Maintainer: Raymond Wanyoike <raymond[dot]wanyoike[at]gmail[dot]com>
 
 _gitauthor=galliumos
 _gitname=galliumos-baytrail
@@ -19,12 +19,10 @@ sha256sums=("SKIP")
 
 pkgver() {
   cd "${_gitname}"
-
   printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 package() {
   cd "${_gitname}"
-
   install -m644 -Dt "${pkgdir}/etc/modprobe.d" etc/modprobe.d/iwlwifi-opts.conf
 }

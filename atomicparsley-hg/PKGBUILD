@@ -1,10 +1,10 @@
-# Maintainer: Raymond Wanyoike <raymond dot wanyoike at gmail dot com>
+# Maintainer: Raymond Wanyoike <raymond[dot]wanyoike[at]gmail[dot]com>
 
 _gitauthor=wez
 _gitname=atomicparsley
 
 pkgname="${_gitname}"-hg
-pkgver=r110.3c31f225a823
+pkgver="r110.3c31f225a823"
 pkgrel=1
 pkgdesc="A command line program for reading, parsing and setting iTunes-style metadata in MPEG4 files"
 arch=("any")
@@ -18,13 +18,11 @@ sha256sums=("SKIP")
 
 pkgver() {
   cd "${_gitname}"
-
   printf "r%s.%s" "$(hg identify -n)" "$(hg identify -i)"
 }
 
 build() {
   cd "${_gitname}"
-
   ./autogen.sh
   ./configure --prefix=/usr
   make
@@ -32,6 +30,5 @@ build() {
 
 package() {
   cd "${_gitname}"
-
   make DESTDIR="${pkgdir}" install
 }

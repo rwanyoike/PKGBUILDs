@@ -1,4 +1,4 @@
-# Maintainer: Raymond Wanyoike <raymond dot wanyoike at gmail dot com>
+# Maintainer: Raymond Wanyoike <raymond[dot]wanyoike[at]gmail[dot]com>
 
 _gitauthor=galliumos
 _gitname=xkeyboard-config
@@ -16,19 +16,19 @@ conflicts=("${_gitname}" "xkbdata")
 source=(
   https://xorg.freedesktop.org/archive/individual/data/${_gitname}/${_gitname}-${pkgver}.tar.bz2{,.sig}
   "git+https://github.com/${_gitauthor}/${_gitname}.git")
-validpgpkeys=(
-  "FFB4CCD275AAA422F5F9808E0661D98FC933A145"
-  "SKIP")
 sha256sums=(
   "d1bfc72553c4e3ef1cd6f13eec0488cf940498b612ab8a0b362e7090c94bc134"
   "SKIP"
   "SKIP")
+validpgpkeys=("FFB4CCD275AAA422F5F9808E0661D98FC933A145")
+
+prepare() {
+  cd "${_gitname}-${pkgver}"
+  patch -p1 < "${srcdir}/${_gitname}/debian/patches/chromebook.patch"
+}
 
 build() {
   cd "${_gitname}-${pkgver}"
-
-  patch -p1 -i "${srcdir}/${_gitname}/debian/patches/chromebook.patch"
-
   ./configure --prefix=/usr \
       --with-xkb-base=/usr/share/X11/xkb \
       --with-xkb-rules-symlink=xorg \
@@ -38,9 +38,7 @@ build() {
 
 package() {
   cd "${_gitname}-${pkgver}"
-
   make DESTDIR="${pkgdir}" install
-
   install -m755 -d "${pkgdir}/var/lib/xkb"
   install -m644 -Dt "${pkgdir}/usr/share/licenses" COPYING
 }

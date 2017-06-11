@@ -1,0 +1,987 @@
+diff --git a/Common/SecurityToken.cpp b/Common/SecurityToken.cpp
+index 4788023..274489f 100644
+--- a/Common/SecurityToken.cpp
++++ b/Common/SecurityToken.cpp
+@@ -657,8 +657,6 @@ namespace TrueCrypt
+ 			TC_TOKEN_ERR (CKR_CRYPTOKI_ALREADY_INITIALIZED)
+ 			TC_TOKEN_ERR (CKR_MUTEX_BAD)
+ 			TC_TOKEN_ERR (CKR_MUTEX_NOT_LOCKED)
+-			TC_TOKEN_ERR (CKR_NEW_PIN_MODE)
+-			TC_TOKEN_ERR (CKR_NEXT_OTP)
+ 			TC_TOKEN_ERR (CKR_FUNCTION_REJECTED)
+ 
+ #undef		TC_TOKEN_ERR
+diff --git a/Core/CoreBase.h b/Core/CoreBase.h
+index d99420a..fa018ef 100644
+--- a/Core/CoreBase.h
++++ b/Core/CoreBase.h
+@@ -63,6 +63,7 @@ namespace TrueCrypt
+ 		virtual bool IsSlotNumberValid (VolumeSlotNumber slotNumber) const { return slotNumber >= GetFirstSlotNumber() && slotNumber <= GetLastSlotNumber(); }
+ 		virtual bool IsVolumeMounted (const VolumePath &volumePath) const;
+ 		virtual VolumeSlotNumber MountPointToSlotNumber (const DirectoryPath &mountPoint) const = 0;
++		virtual shared_ptr <VolumeInfo> SearchVolume (MountOptions &options) = 0;
+ 		virtual shared_ptr <VolumeInfo> MountVolume (MountOptions &options) = 0;
+ 		virtual shared_ptr <Volume> OpenVolume (shared_ptr <VolumePath> volumePath, bool preserveTimestamps, shared_ptr <VolumePassword> password, shared_ptr <KeyfileList> keyfiles, VolumeProtection::Enum protection = VolumeProtection::None, shared_ptr <VolumePassword> protectionPassword = shared_ptr <VolumePassword> (), shared_ptr <KeyfileList> protectionKeyfiles = shared_ptr <KeyfileList> (), bool sharedAccessAllowed = false, VolumeType::Enum volumeType = VolumeType::Unknown, bool useBackupHeaders = false, bool partitionInSystemEncryptionScope = false) const;
+ 		virtual void RandomizeEncryptionAlgorithmKey (shared_ptr <EncryptionAlgorithm> encryptionAlgorithm) const;
+diff --git a/Core/Unix/CoreService.cpp b/Core/Unix/CoreService.cpp
+index 0ec636c..fc6de0a 100644
+--- a/Core/Unix/CoreService.cpp
++++ b/Core/Unix/CoreService.cpp
+@@ -179,6 +179,17 @@ namespace TrueCrypt
+ 						continue;
+ 					}
+ 
++					// SearchVolumeRequest
++					SearchVolumeRequest *searchRequest = dynamic_cast <SearchVolumeRequest*> (request.get());
++					if (searchRequest)
++					{
++						MountVolumeResponse (
++							Core->SearchVolume (*searchRequest->Options)
++						).Serialize (outputStream);
++
++						continue;
++					}
++
+ 					// MountVolumeRequest
+ 					MountVolumeRequest *mountRequest = dynamic_cast <MountVolumeRequest*> (request.get());
+ 					if (mountRequest)
+@@ -260,6 +271,12 @@ namespace TrueCrypt
+ 		return SendRequest <GetHostDevicesResponse> (request)->HostDevices;
+ 	}
+ 	
++	shared_ptr <VolumeInfo> CoreService::RequestSearchVolume (MountOptions &options)
++	{
++		SearchVolumeRequest request (&options);
++		return SendRequest <MountVolumeResponse> (request)->MountedVolumeInfo;
++	}
++
+ 	shared_ptr <VolumeInfo> CoreService::RequestMountVolume (MountOptions &options)
+ 	{
+ 		MountVolumeRequest request (&options);
+diff --git a/Core/Unix/CoreService.h b/Core/Unix/CoreService.h
+index 9702dc7..63daf99 100644
+--- a/Core/Unix/CoreService.h
++++ b/Core/Unix/CoreService.h
+@@ -28,6 +28,7 @@ namespace TrueCrypt
+ 		static uint32 RequestGetDeviceSectorSize (const DevicePath &devicePath);
+ 		static uint64 RequestGetDeviceSize (const DevicePath &devicePath);
+ 		static HostDeviceList RequestGetHostDevices (bool pathListOnly);
++		static shared_ptr <VolumeInfo> RequestSearchVolume (MountOptions &options);
+ 		static shared_ptr <VolumeInfo> RequestMountVolume (MountOptions &options);
+ 		static void RequestSetFileOwner (const FilesystemPath &path, const UserId &owner);
+ 		static void SetAdminPasswordCallback (shared_ptr <GetStringFunctor> functor) { AdminPasswordCallback = functor; }
+diff --git a/Core/Unix/CoreServiceProxy.h b/Core/Unix/CoreServiceProxy.h
+index 2a26461..79dc02f 100644
+--- a/Core/Unix/CoreServiceProxy.h
++++ b/Core/Unix/CoreServiceProxy.h
+@@ -62,6 +62,59 @@ namespace TrueCrypt
+ #endif
+ 		virtual bool IsPasswordCacheEmpty () const { return VolumePasswordCache::IsEmpty(); }
+ 
++		virtual shared_ptr <VolumeInfo> SearchVolume (MountOptions &options)
++		{
++			shared_ptr <VolumeInfo> mountedVolume;
++
++			if (!VolumePasswordCache::IsEmpty()
++				&& (!options.Password || options.Password->IsEmpty())
++				&& (!options.Keyfiles || options.Keyfiles->empty()))
++			{
++				/* Searching for a volume is expensive. Throw exception instead */
++				throw PasswordKeyfilesIncorrect ();
++			}
++			else
++			{
++				MountOptions newOptions = options;
++
++				newOptions.Password = Keyfile::ApplyListToPassword (options.Keyfiles, options.Password);
++				if (newOptions.Keyfiles)
++					newOptions.Keyfiles->clear();
++
++				newOptions.ProtectionPassword = Keyfile::ApplyListToPassword (options.ProtectionKeyfiles, options.ProtectionPassword);
++				if (newOptions.ProtectionKeyfiles)
++					newOptions.ProtectionKeyfiles->clear();
++
++				try
++				{
++					mountedVolume = CoreService::RequestSearchVolume (newOptions);
++				}
++				catch (ProtectionPasswordIncorrect &e)
++				{
++					if (options.ProtectionKeyfiles && !options.ProtectionKeyfiles->empty())
++						throw ProtectionPasswordKeyfilesIncorrect (e.what());
++					throw;
++				}
++				catch (PasswordIncorrect &e)
++				{
++					if (options.Keyfiles && !options.Keyfiles->empty())
++						throw PasswordKeyfilesIncorrect (e.what());
++					throw;
++				}
++
++				if (options.CachePassword
++					&& ((options.Password && !options.Password->IsEmpty()) || (options.Keyfiles && !options.Keyfiles->empty())))
++				{
++					VolumePasswordCache::Store (*Keyfile::ApplyListToPassword (options.Keyfiles, options.Password));
++				}
++			}
++
++			VolumeEventArgs eventArgs (mountedVolume);
++			T::VolumeMountedEvent.Raise (eventArgs);
++
++			return mountedVolume;
++		}
++
+ 		virtual shared_ptr <VolumeInfo> MountVolume (MountOptions &options)
+ 		{
+ 			shared_ptr <VolumeInfo> mountedVolume;
+diff --git a/Core/Unix/CoreServiceRequest.cpp b/Core/Unix/CoreServiceRequest.cpp
+index 49ee841..a677cda 100644
+--- a/Core/Unix/CoreServiceRequest.cpp
++++ b/Core/Unix/CoreServiceRequest.cpp
+@@ -189,6 +189,43 @@ namespace TrueCrypt
+ 		CoreServiceRequest::Serialize (stream);
+ 	}
+ 
++	// SearchVolumeRequest
++	void SearchVolumeRequest::Deserialize (shared_ptr <Stream> stream)
++	{
++		CoreServiceRequest::Deserialize (stream);
++		Serializer sr (stream);
++		DeserializedOptions = Serializable::DeserializeNew <MountOptions> (stream);
++		Options = DeserializedOptions.get();
++	}
++
++	bool SearchVolumeRequest::RequiresElevation () const
++	{
++#ifdef TC_MACOSX
++		if (Options->Path->IsDevice())
++		{
++			try
++			{
++				File file;
++				file.Open (*Options->Path, File::OpenReadWrite);
++			}
++			catch (...)
++			{
++				return true;
++			}
++		}
++
++		return false;
++#endif
++		return !Core->HasAdminPrivileges();
++	}
++
++	void SearchVolumeRequest::Serialize (shared_ptr <Stream> stream) const
++	{
++		CoreServiceRequest::Serialize (stream);
++		Serializer sr (stream);
++		Options->Serialize (stream);
++	}
++
+ 	// MountVolumeRequest
+ 	void MountVolumeRequest::Deserialize (shared_ptr <Stream> stream)
+ 	{
+@@ -264,6 +301,7 @@ namespace TrueCrypt
+ 	TC_SERIALIZER_FACTORY_ADD_CLASS (GetDeviceSectorSizeRequest);
+ 	TC_SERIALIZER_FACTORY_ADD_CLASS (GetDeviceSizeRequest);
+ 	TC_SERIALIZER_FACTORY_ADD_CLASS (GetHostDevicesRequest);
++	TC_SERIALIZER_FACTORY_ADD_CLASS (SearchVolumeRequest);
+ 	TC_SERIALIZER_FACTORY_ADD_CLASS (MountVolumeRequest);
+ 	TC_SERIALIZER_FACTORY_ADD_CLASS (SetFileOwnerRequest);
+ }
+diff --git a/Core/Unix/CoreServiceRequest.h b/Core/Unix/CoreServiceRequest.h
+index 030ac81..571772a 100644
+--- a/Core/Unix/CoreServiceRequest.h
++++ b/Core/Unix/CoreServiceRequest.h
+@@ -119,6 +119,20 @@ namespace TrueCrypt
+ 		shared_ptr <MountOptions> DeserializedOptions;
+ 	};
+ 
++	/* Search a file system for a truecrypt volume */
++	struct SearchVolumeRequest : CoreServiceRequest
++	{
++		SearchVolumeRequest () { }
++		SearchVolumeRequest (MountOptions *options) : Options (options) { }
++		TC_SERIALIZABLE (SearchVolumeRequest);
++
++		virtual bool RequiresElevation () const;
++
++		MountOptions *Options;
++
++	protected:
++		shared_ptr <MountOptions> DeserializedOptions;
++	};
+ 
+ 	struct SetFileOwnerRequest : CoreServiceRequest
+ 	{
+diff --git a/Core/Unix/CoreUnix.cpp b/Core/Unix/CoreUnix.cpp
+index 89f34e2..153f750 100644
+--- a/Core/Unix/CoreUnix.cpp
++++ b/Core/Unix/CoreUnix.cpp
+@@ -390,6 +390,258 @@ namespace TrueCrypt
+ 		return GetFirstFreeSlotNumber();
+ 	}
+ 
++	shared_ptr <VolumeInfo> CoreUnix::SearchVolume (MountOptions &options)
++	{
++		CoalesceSlotNumberAndMountPoint (options);
++
++		if (IsVolumeMounted (*options.Path))
++			throw VolumeAlreadyMounted (SRC_POS);
++
++		Cipher::EnableHwSupport (!options.NoHardwareCrypto);
++
++		printf("CoreUnix::SearchVolume\n");
++
++		make_shared_auto (Volume, volume);
++		options.Protection = VolumeProtection::ReadOnly;
++
++		/* Open the file system one byte offset at a time */
++		shared_ptr<File> file;
++		uint64 file_length;
++		uint64 cnt_pos = 0;
++
++		file = volume->OpenFile (
++						options.Path,
++						cnt_pos,
++						options.PreserveTimestamps,
++						options.Protection,
++						options.SharedAccessAllowed
++						);
++
++		/* get capacity */
++		file_length = file->Length();
++		printf("file_length: %ld\n", file_length);
++
++		time_t t;
++		time_t start_time;
++		double percent;
++		long seconds_elapsed;
++		long seconds_left;
++		struct tm * time_left;
++		struct tm * time_elapsed;
++		char timestr[50];
++		char elapsed[50];
++		int days_elapsed;
++		int days_remaining;
++		int years_remaining;
++
++		start_time = t = time(0);
++		/* Assume header starts on 512 byte sector boundaries */
++		for(cnt_pos = 0; cnt_pos < file_length; cnt_pos += 512)
++		{
++			if(time(0) > t)
++			{
++				t = time(0);
++				percent = cnt_pos / (double) file_length;
++
++				//seconds_left = seconds_elapsed * bytes_remaining  / (double) i;
++				seconds_elapsed = (t - start_time);
++				// seconds left = total left / (tries per second)
++				// tries per second = cnt pos / seconds elapsed
++
++				seconds_left = (seconds_elapsed * (file_length - cnt_pos)) / (double) cnt_pos;
++				time_elapsed = gmtime ( &seconds_elapsed );
++
++				strftime(elapsed, sizeof(elapsed), "%T", time_elapsed);
++				days_elapsed = time_elapsed->tm_yday;
++
++				time_left = gmtime ( &seconds_left );
++				strftime(timestr, sizeof(timestr), "%T", time_left);
++				years_remaining = seconds_left / 31557600;
++				days_remaining  = (seconds_left - years_remaining * 31557600) / 86400;
++
++				fprintf(stderr, "%f%% (%'ld of %'ld)(0x%lx of 0x%lx) %d:%s elapsed, %dy:%d:%s left\n",
++						percent*100,
++						cnt_pos, file_length,
++						cnt_pos, file_length,
++						days_elapsed, elapsed,
++						years_remaining, days_remaining, timestr);
++			}
++
++			/* Attempt to open as a truecrypt volume */
++			try
++			{
++				file->SeekAt(cnt_pos);
++				volume->OpenAt (
++						file,
++						cnt_pos,
++						options.Password,
++						options.Keyfiles,
++						options.Protection,
++						options.ProtectionPassword,
++						options.ProtectionKeyfiles,
++						VolumeType::Unknown,
++						options.UseBackupHeaders,
++						options.PartitionInSystemEncryptionScope);
++
++				break;
++			}
++			catch (PasswordIncorrect &e)
++			{
++				continue;
++			}
++			catch (SystemException &e)
++			{
++				printf("System exception\n");
++				throw;
++			}
++			printf("End of loop\n");
++		}
++
++		if(!volume)
++		{
++			printf("Failed to find volume\n");
++			throw PasswordIncorrect();
++		}
++
++		printf("SUCCESS!!!! at %lx\n", cnt_pos);
++
++		if (options.Path->IsDevice())
++		{
++			if (volume->GetFile()->GetDeviceSectorSize() != volume->GetSectorSize())
++				throw ParameterIncorrect (SRC_POS);
++
++#if defined (TC_LINUX)
++			if (volume->GetSectorSize() != TC_SECTOR_SIZE_LEGACY)
++			{
++				if (options.Protection == VolumeProtection::HiddenVolumeReadOnly)
++					throw UnsupportedSectorSizeHiddenVolumeProtection();
++
++				if (options.NoKernelCrypto)
++					throw UnsupportedSectorSizeNoKernelCrypto();
++			}
++#endif
++		}
++
++		// Find a free mount point for FUSE service
++		MountedFilesystemList mountedFilesystems = GetMountedFilesystems ();
++		string fuseMountPoint;
++		for (int i = 1; true; i++)
++		{
++			stringstream path;
++			path << GetTempDirectory() << "/" << GetFuseMountDirPrefix() << i;
++			FilesystemPath fsPath (path.str());
++
++			bool inUse = false;
++
++			foreach_ref (const MountedFilesystem &mf, mountedFilesystems)
++			{
++				if (mf.MountPoint == path.str())
++				{
++					inUse = true;
++					break;
++				}
++			}
++
++			if (!inUse)
++			{
++				try
++				{
++					if (fsPath.IsDirectory())
++						fsPath.Delete();
++
++					throw_sys_sub_if (mkdir (path.str().c_str(), S_IRUSR | S_IXUSR) == -1, path.str());
++
++					fuseMountPoint = fsPath;
++					break;
++				}
++				catch (...)
++				{
++					if (i > 255)
++						throw TemporaryDirectoryFailure (SRC_POS, StringConverter::ToWide (path.str()));
++				}
++			}
++		}
++
++		try
++		{
++			FuseService::Mount (volume, options.SlotNumber, fuseMountPoint);
++		}
++		catch (...)
++		{
++			try
++			{
++				DirectoryPath (fuseMountPoint).Delete();
++			}
++			catch (...) { }
++			throw;
++		}
++
++		try
++		{
++			// Create a mount directory if a default path has been specified
++			bool mountDirCreated = false;
++			string mountPoint;
++			if (!options.NoFilesystem && options.MountPoint)
++			{
++				mountPoint = *options.MountPoint;
++
++#ifndef TC_MACOSX
++				if (mountPoint.find (GetDefaultMountPointPrefix()) == 0 && !options.MountPoint->IsDirectory())
++				{
++					Directory::Create (*options.MountPoint);
++					try
++					{
++						throw_sys_sub_if (chown (mountPoint.c_str(), GetRealUserId(), GetRealGroupId()) == -1, mountPoint);
++					} catch (ParameterIncorrect&) { }
++
++					mountDirCreated = true;
++				}
++#endif
++			}
++
++			try
++			{
++				try
++				{
++					MountVolumeNative (volume, options, fuseMountPoint);
++				}
++				catch (NotApplicable&)
++				{
++					MountAuxVolumeImage (fuseMountPoint, options);
++				}
++			}
++			catch (...)
++			{
++				if (mountDirCreated)
++					remove (mountPoint.c_str());
++				throw;
++			}
++		}
++		catch (...)
++		{
++			try
++			{
++				VolumeInfoList mountedVolumes = GetMountedVolumes (*options.Path);
++				if (mountedVolumes.size() > 0)
++				{
++					shared_ptr <VolumeInfo> mountedVolume (mountedVolumes.front());
++					DismountVolume (mountedVolume);
++				}
++			}
++			catch (...) { }
++			throw;
++		}
++
++		VolumeInfoList mountedVolumes = GetMountedVolumes (*options.Path);
++		if (mountedVolumes.size() != 1)
++			throw ParameterIncorrect (SRC_POS);
++
++		VolumeEventArgs eventArgs (mountedVolumes.front());
++		VolumeMountedEvent.Raise (eventArgs);
++
++		return mountedVolumes.front();
++	}
++
+ 	shared_ptr <VolumeInfo> CoreUnix::MountVolume (MountOptions &options)
+ 	{
+ 		CoalesceSlotNumberAndMountPoint (options);
+diff --git a/Core/Unix/CoreUnix.h b/Core/Unix/CoreUnix.h
+index 1d7152f..02573bc 100644
+--- a/Core/Unix/CoreUnix.h
++++ b/Core/Unix/CoreUnix.h
+@@ -40,6 +40,7 @@ namespace TrueCrypt
+ 		virtual bool IsPasswordCacheEmpty () const { throw NotApplicable (SRC_POS); }
+ 		virtual bool HasAdminPrivileges () const { return getuid() == 0 || geteuid() == 0; }
+ 		virtual VolumeSlotNumber MountPointToSlotNumber (const DirectoryPath &mountPoint) const;
++		virtual shared_ptr <VolumeInfo> SearchVolume (MountOptions &options);
+ 		virtual shared_ptr <VolumeInfo> MountVolume (MountOptions &options);
+ 		virtual void SetFileOwner (const FilesystemPath &path, const UserId &owner) const;
+ 		virtual DirectoryPath SlotNumberToMountPoint (VolumeSlotNumber slotNumber) const;
+diff --git a/Main/CommandLineInterface.cpp b/Main/CommandLineInterface.cpp
+index ab5f90b..9a2cad4 100644
+--- a/Main/CommandLineInterface.cpp
++++ b/Main/CommandLineInterface.cpp
+@@ -76,6 +76,7 @@ namespace TrueCrypt
+ 		parser.AddSwitch (L"",	L"version",				_("Display version information"));
+ 		parser.AddSwitch (L"",	L"volume-properties",	_("Display volume properties"));
+ 		parser.AddOption (L"",	L"volume-type",			_("Volume type"));
++		parser.AddSwitch (L"",	L"search",				_("Search for the truecrypt volume"));
+ 		parser.AddParam (								_("Volume path"), wxCMD_LINE_VAL_STRING, wxCMD_LINE_PARAM_OPTIONAL);
+ 		parser.AddParam (								_("Mount point"), wxCMD_LINE_VAL_STRING, wxCMD_LINE_PARAM_OPTIONAL);
+ 
+@@ -214,6 +215,13 @@ namespace TrueCrypt
+ 			ArgCommand = CommandId::ListSecurityTokenKeyfiles;
+ 		}
+ 
++		if (parser.Found (L"search"))
++		{
++			CheckCommandSingle();
++			ArgCommand = CommandId::SearchVolume;
++			param1IsVolume = true;
++		}
++
+ 		if (parser.Found (L"mount"))
+ 		{
+ 			CheckCommandSingle();
+diff --git a/Main/CommandLineInterface.h b/Main/CommandLineInterface.h
+index 50f98f6..447f361 100644
+--- a/Main/CommandLineInterface.h
++++ b/Main/CommandLineInterface.h
+@@ -41,6 +41,7 @@ namespace TrueCrypt
+ 			ListSecurityTokenKeyfiles,
+ 			ListVolumes,
+ 			MountVolume,
++			SearchVolume,
+ 			RestoreHeaders,
+ 			SavePreferences,
+ 			Test
+diff --git a/Main/UserInterface.cpp b/Main/UserInterface.cpp
+index 9e8179f..13e896f 100644
+--- a/Main/UserInterface.cpp
++++ b/Main/UserInterface.cpp
+@@ -876,6 +876,7 @@ namespace TrueCrypt
+ 		case CommandId::AutoMountDevices:
+ 		case CommandId::AutoMountFavorites:
+ 		case CommandId::AutoMountDevicesFavorites:
++		case CommandId::SearchVolume:
+ 		case CommandId::MountVolume:
+ 			{
+ 				cmdLine.ArgMountOptions.Path = cmdLine.ArgVolumePath;
+@@ -910,6 +911,13 @@ namespace TrueCrypt
+ 
+ 					break;
+ 
++				case CommandId::SearchVolume:
++					if (!cmdLine.ArgMountOptions.Path)
++						throw MissingArgument (SRC_POS);
++
++					mountedVolumes.push_back (Core->SearchVolume (cmdLine.ArgMountOptions));
++					break;
++
+ 				case CommandId::MountVolume:
+ 					if (Preferences.OpenExplorerWindowAfterMount)
+ 					{
+diff --git a/Volume/Pkcs5Kdf.cpp b/Volume/Pkcs5Kdf.cpp
+index 9f9a4d9..42398ec 100644
+--- a/Volume/Pkcs5Kdf.cpp
++++ b/Volume/Pkcs5Kdf.cpp
+@@ -51,9 +51,6 @@ namespace TrueCrypt
+ 		Pkcs5KdfList l;
+ 		
+ 		l.push_back (shared_ptr <Pkcs5Kdf> (new Pkcs5HmacRipemd160 ()));
+-		l.push_back (shared_ptr <Pkcs5Kdf> (new Pkcs5HmacSha512 ()));
+-		l.push_back (shared_ptr <Pkcs5Kdf> (new Pkcs5HmacWhirlpool ()));
+-		l.push_back (shared_ptr <Pkcs5Kdf> (new Pkcs5HmacSha1 ()));
+ 
+ 		return l;
+ 	}
+diff --git a/Volume/Volume.cpp b/Volume/Volume.cpp
+index 0acdbb2..dbb5e07 100644
+--- a/Volume/Volume.cpp
++++ b/Volume/Volume.cpp
+@@ -15,6 +15,7 @@
+ #include "VolumeHeader.h"
+ #include "VolumeLayout.h"
+ #include "Common/Crypto.h"
++#include <stdio.h>
+ 
+ namespace TrueCrypt
+ {
+@@ -63,6 +64,45 @@ namespace TrueCrypt
+ 		return EA->GetMode();
+ 	}
+ 
++	shared_ptr <File> Volume::OpenFile (shared_ptr <VolumePath> volumePath, uint64 offset, bool preserveTimestamps, VolumeProtection::Enum protection, bool sharedAccessAllowed)
++	{
++		make_shared_auto (File, file);
++
++		const VolumePath filePath = *volumePath;
++
++		File::FileOpenFlags flags = (preserveTimestamps ? File::PreserveTimestamps : File::FlagsNone);
++
++		try
++		{
++			if (protection == VolumeProtection::ReadOnly) {
++				file->Open (filePath, File::OpenRead, File::ShareRead, flags);
++			}
++			else {
++				file->Open (filePath, File::OpenReadWrite, File::ShareNone, flags);
++			}
++			file->SeekAt(offset); /* XXX */
++		}
++		catch (SystemException &e)
++		{
++			if (e.GetErrorCode() ==
++#ifdef TC_WINDOWS
++				ERROR_SHARING_VIOLATION)
++#else
++				EAGAIN)
++#endif
++			{
++				if (!sharedAccessAllowed)
++					throw VolumeHostInUse (SRC_POS);
++
++				file->Open (filePath, protection == VolumeProtection::ReadOnly ? File::OpenRead : File::OpenReadWrite, File::ShareReadWriteIgnoreLock, flags);
++			}
++			else
++				throw;
++		}
++
++		return file;
++	}
++
+ 	void Volume::Open (const VolumePath &volumePath, bool preserveTimestamps, shared_ptr <VolumePassword> password, shared_ptr <KeyfileList> keyfiles, VolumeProtection::Enum protection, shared_ptr <VolumePassword> protectionPassword, shared_ptr <KeyfileList> protectionKeyfiles, bool sharedAccessAllowed, VolumeType::Enum volumeType, bool useBackupHeaders, bool partitionInSystemEncryptionScope)
+ 	{
+ 		make_shared_auto (File, file);
+@@ -97,6 +137,227 @@ namespace TrueCrypt
+ 		return Open (file, password, keyfiles, protection, protectionPassword, protectionKeyfiles, volumeType, useBackupHeaders, partitionInSystemEncryptionScope);
+ 	}
+ 
++	void Volume::OpenAt(shared_ptr<File> volumeFile, uint64 offset, shared_ptr <VolumePassword>password, shared_ptr <KeyfileList> keyfiles, VolumeProtection::Enum protection, shared_ptr <VolumePassword> protectionPassword, shared_ptr <KeyfileList> protectionKeyfiles, VolumeType::Enum volumeType, bool useBackupHeaders, bool partitionInSystemEncryptionScope)
++	{
++		if (!volumeFile)
++		throw ParameterIncorrect (SRC_POS);
++
++		Protection = protection;
++		VolumeFile = volumeFile;
++		SystemEncryption = partitionInSystemEncryptionScope;
++
++		try
++		{
++			VolumeHostSize = VolumeFile->Length();
++			shared_ptr <VolumePassword> passwordKey = Keyfile::ApplyListToPassword (keyfiles, password);
++
++			bool skipLayoutV1Normal = false;
++
++			bool deviceHosted = GetPath().IsDevice();
++			size_t hostDeviceSectorSize = 0;
++			if (deviceHosted)
++			hostDeviceSectorSize = volumeFile->GetDeviceSectorSize();
++
++			// Test volume layouts
++			foreach (shared_ptr <VolumeLayout> layout, VolumeLayout::GetAvailableLayouts (volumeType))
++			{
++				// printf("Trying volume layout %d\n", typeid(*layout) == typeid (VolumeLayoutV2Normal));
++				if (skipLayoutV1Normal && typeid (*layout) == typeid (VolumeLayoutV1Normal))
++				{
++					// Skip VolumeLayoutV1Normal as it shares header location with VolumeLayoutV2Normal
++					continue;
++				}
++
++				if (useBackupHeaders && !layout->HasBackupHeader())
++				continue;
++
++				if (typeid (*layout) == typeid (VolumeLayoutV1Hidden)
++						&& deviceHosted
++						&& hostDeviceSectorSize != TC_SECTOR_SIZE_LEGACY)
++				{
++					continue;
++				}
++
++				SecureBuffer headerBuffer (layout->GetHeaderSize());
++
++				if (layout->HasDriveHeader())
++				{
++					if (!partitionInSystemEncryptionScope)
++					continue;
++
++					if (!GetPath().IsDevice())
++					throw PartitionDeviceRequired (SRC_POS);
++
++					File driveDevice;
++					driveDevice.Open (DevicePath (wstring (GetPath())).ToHostDriveOfPartition());
++
++					int headerOffset = layout->GetHeaderOffset();
++
++					if (headerOffset >= 0){
++						driveDevice.SeekAt (headerOffset + offset);
++					}
++					else{
++						printf("Seeking to end FAIL\n");
++						driveDevice.SeekEnd (headerOffset);
++					}
++
++					if (driveDevice.Read (headerBuffer) != layout->GetHeaderSize())
++					continue;
++				}
++				else
++				{
++					if (partitionInSystemEncryptionScope)
++					continue;
++
++					int headerOffset = useBackupHeaders ? layout->GetBackupHeaderOffset() : layout->GetHeaderOffset();
++
++					if (headerOffset >= 0){
++						VolumeFile->SeekAt (headerOffset + offset);
++					}
++					else{
++						//printf("Seeing to end FAIL2\n");
++						VolumeFile->SeekEnd (headerOffset);
++					}
++
++					if (VolumeFile->Read (headerBuffer) != layout->GetHeaderSize())
++					continue;
++				}
++
++				EncryptionAlgorithmList layoutEncryptionAlgorithms = layout->GetSupportedEncryptionAlgorithms();
++				EncryptionModeList layoutEncryptionModes = layout->GetSupportedEncryptionModes();
++
++				/*
++				if (typeid (*layout) == typeid (VolumeLayoutV2Normal))
++				{
++					skipLayoutV1Normal = true;
++
++					// Test all algorithms and modes of VolumeLayoutV1Normal as it shares header location with VolumeLayoutV2Normal
++					layoutEncryptionAlgorithms = EncryptionAlgorithm::GetAvailableAlgorithms();
++					layoutEncryptionModes = EncryptionMode::GetAvailableModes();
++				}
++				*/
++
++				shared_ptr <VolumeHeader> header = layout->GetHeader();
++
++				if (header->Decrypt (headerBuffer, *passwordKey, layout->GetSupportedKeyDerivationFunctions(), layoutEncryptionAlgorithms, layoutEncryptionModes))
++				{
++					// Header decrypted
++
++					printf("Header Decrypt Success!\n");
++
++					if (typeid (*layout) == typeid (VolumeLayoutV2Normal) && header->GetRequiredMinProgramVersion() < 0x600)
++					{
++						// VolumeLayoutV1Normal has been opened as VolumeLayoutV2Normal
++						layout.reset (new VolumeLayoutV1Normal);
++						header->SetSize (layout->GetHeaderSize());
++						layout->SetHeader (header);
++					}
++
++					Type = layout->GetType();
++					SectorSize = header->GetSectorSize();
++
++					VolumeDataOffset = layout->GetDataOffset (VolumeHostSize);
++					VolumeDataSize = layout->GetDataSize (VolumeHostSize);
++
++					Header = header;
++					Layout = layout;
++					EA = header->GetEncryptionAlgorithm();
++					EncryptionMode &mode = *EA->GetMode();
++
++					if (layout->HasDriveHeader())
++					{
++						if (header->GetEncryptedAreaLength() != header->GetVolumeDataSize())
++						throw VolumeEncryptionNotCompleted (SRC_POS);
++
++						uint64 partitionStartOffset = VolumeFile->GetPartitionDeviceStartOffset();
++
++						if (partitionStartOffset < header->GetEncryptedAreaStart()
++								|| partitionStartOffset >= header->GetEncryptedAreaStart() + header->GetEncryptedAreaLength())
++						throw PasswordIncorrect (SRC_POS);
++
++						mode.SetSectorOffset (partitionStartOffset / ENCRYPTION_DATA_UNIT_SIZE);
++					}
++					else if (typeid (mode) == typeid (EncryptionModeLRW))
++					{
++						mode.SetSectorOffset (VolumeDataOffset / SectorSize);
++					}
++
++					// Volume protection
++					if (Protection == VolumeProtection::HiddenVolumeReadOnly)
++					{
++						if (Type == VolumeType::Hidden)
++						throw PasswordIncorrect (SRC_POS);
++						else
++						{
++							try
++							{
++								Volume protectedVolume;
++
++								protectedVolume.Open (VolumeFile,
++										protectionPassword, protectionKeyfiles,
++										VolumeProtection::ReadOnly,
++										shared_ptr <VolumePassword> (), shared_ptr <KeyfileList> (),
++										VolumeType::Hidden,
++										useBackupHeaders);
++
++								if (protectedVolume.GetType() != VolumeType::Hidden)
++								ParameterIncorrect (SRC_POS);
++
++								ProtectedRangeStart = protectedVolume.VolumeDataOffset;
++								ProtectedRangeEnd = protectedVolume.VolumeDataOffset + protectedVolume.VolumeDataSize;
++
++								if (typeid (*protectedVolume.Layout) == typeid (VolumeLayoutV1Hidden))
++								ProtectedRangeEnd += protectedVolume.Layout->GetHeaderSize();
++							}
++							catch (PasswordException&)
++							{
++								if (protectionKeyfiles && !protectionKeyfiles->empty())
++								throw ProtectionPasswordKeyfilesIncorrect (SRC_POS);
++								throw ProtectionPasswordIncorrect (SRC_POS);
++							}
++						}
++					}
++					return;
++				}
++			}
++
++			if (partitionInSystemEncryptionScope)
++			throw PasswordOrKeyboardLayoutIncorrect (SRC_POS);
++
++			if (!partitionInSystemEncryptionScope && GetPath().IsDevice())
++			{
++				// Check if the device contains TrueCrypt Boot Loader
++				try
++				{
++					File driveDevice;
++					driveDevice.Open (DevicePath (wstring (GetPath())).ToHostDriveOfPartition());
++
++					Buffer mbr (VolumeFile->GetDeviceSectorSize());
++					driveDevice.ReadAt (mbr, 0);
++
++					// Search for the string "TrueCrypt"
++					size_t nameLen = strlen (TC_APP_NAME);
++					for (size_t i = 0; i < mbr.Size() - nameLen; ++i)
++					{
++						if (memcmp (mbr.Ptr() + i, TC_APP_NAME, nameLen) == 0)
++						throw PasswordOrMountOptionsIncorrect (SRC_POS);
++					}
++				}
++				catch (PasswordOrMountOptionsIncorrect&) {throw;}
++				catch (...) {}
++			}
++
++			if (keyfiles && !keyfiles->empty())
++			throw PasswordKeyfilesIncorrect (SRC_POS);
++			throw PasswordIncorrect (SRC_POS);
++		}
++		catch (...)
++		{
++			Close();
++			throw;
++		}
++	}
++
+ 	void Volume::Open (shared_ptr <File> volumeFile, shared_ptr <VolumePassword> password, shared_ptr <KeyfileList> keyfiles, VolumeProtection::Enum protection, shared_ptr <VolumePassword> protectionPassword, shared_ptr <KeyfileList> protectionKeyfiles, VolumeType::Enum volumeType, bool useBackupHeaders, bool partitionInSystemEncryptionScope)
+ 	{
+ 		if (!volumeFile)
+diff --git a/Volume/Volume.h b/Volume/Volume.h
+index 8578bec..9e0259c 100644
+--- a/Volume/Volume.h
++++ b/Volume/Volume.h
+@@ -89,7 +89,9 @@ namespace TrueCrypt
+ 		uint64 GetVolumeCreationTime () const { return Header->GetVolumeCreationTime(); }
+ 		bool IsHiddenVolumeProtectionTriggered () const { return HiddenVolumeProtectionTriggered; }
+ 		bool IsInSystemEncryptionScope () const { return SystemEncryption; }
++		shared_ptr <File> OpenFile (shared_ptr <VolumePath> volumePath,	uint64 offset, bool preserveTimestamps, VolumeProtection::Enum protection, bool sharedAccessAllowed);
+ 		void Open (const VolumePath &volumePath, bool preserveTimestamps, shared_ptr <VolumePassword> password, shared_ptr <KeyfileList> keyfiles, VolumeProtection::Enum protection = VolumeProtection::None, shared_ptr <VolumePassword> protectionPassword = shared_ptr <VolumePassword> (), shared_ptr <KeyfileList> protectionKeyfiles = shared_ptr <KeyfileList> (), bool sharedAccessAllowed = false, VolumeType::Enum volumeType = VolumeType::Unknown, bool useBackupHeaders = false, bool partitionInSystemEncryptionScope = false);
++		void OpenAt (shared_ptr <File> volumeFile, uint64 offset, shared_ptr <VolumePassword> password, shared_ptr <KeyfileList> keyfiles, VolumeProtection::Enum protection = VolumeProtection::None, shared_ptr <VolumePassword> protectionPassword = shared_ptr <VolumePassword> (), shared_ptr <KeyfileList> protectionKeyfiles = shared_ptr <KeyfileList> (), VolumeType::Enum volumeType = VolumeType::Unknown, bool useBackupHeaders = false, bool partitionInSystemEncryptionScope = false);
+ 		void Open (shared_ptr <File> volumeFile, shared_ptr <VolumePassword> password, shared_ptr <KeyfileList> keyfiles, VolumeProtection::Enum protection = VolumeProtection::None, shared_ptr <VolumePassword> protectionPassword = shared_ptr <VolumePassword> (), shared_ptr <KeyfileList> protectionKeyfiles = shared_ptr <KeyfileList> (), VolumeType::Enum volumeType = VolumeType::Unknown, bool useBackupHeaders = false, bool partitionInSystemEncryptionScope = false);
+ 		void ReadSectors (const BufferPtr &buffer, uint64 byteOffset);
+ 		void ReEncryptHeader (bool backupHeader, const ConstBufferPtr &newSalt, const ConstBufferPtr &newHeaderKey, shared_ptr <Pkcs5Kdf> newPkcs5Kdf);
+diff --git a/Volume/VolumeLayout.cpp b/Volume/VolumeLayout.cpp
+index 00696e9..67f429d 100644
+--- a/Volume/VolumeLayout.cpp
++++ b/Volume/VolumeLayout.cpp
+@@ -28,10 +28,6 @@ namespace TrueCrypt
+ 		VolumeLayoutList layouts;
+ 
+ 		layouts.push_back (shared_ptr <VolumeLayout> (new VolumeLayoutV2Normal ()));
+-		layouts.push_back (shared_ptr <VolumeLayout> (new VolumeLayoutV1Normal ()));
+-		layouts.push_back (shared_ptr <VolumeLayout> (new VolumeLayoutV2Hidden ()));
+-		layouts.push_back (shared_ptr <VolumeLayout> (new VolumeLayoutV1Hidden ()));
+-		layouts.push_back (shared_ptr <VolumeLayout> (new VolumeLayoutSystemEncryption ()));
+ 
+ 		if (type != VolumeType::Unknown)
+ 		{
+@@ -63,25 +59,6 @@ namespace TrueCrypt
+ 		Type = VolumeType::Normal;
+ 		HeaderOffset = TC_VOLUME_HEADER_OFFSET;
+ 		HeaderSize = TC_VOLUME_HEADER_SIZE_LEGACY;
+-
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Serpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Twofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofishSerpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentTwofishAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new TwofishSerpent ()));
+-
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESBlowfish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESBlowfishSerpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Blowfish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Cast5 ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new TripleDES ()));
+-
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeXTS ()));
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeLRW ()));
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeCBC ()));
+ 	}
+ 
+ 	uint64 VolumeLayoutV1Normal::GetDataOffset (uint64 volumeHostSize) const
+@@ -100,25 +77,6 @@ namespace TrueCrypt
+ 		Type = VolumeType::Hidden;
+ 		HeaderOffset = -TC_HIDDEN_VOLUME_HEADER_OFFSET_LEGACY;
+ 		HeaderSize = TC_VOLUME_HEADER_SIZE_LEGACY;
+-
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Serpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Twofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofishSerpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentTwofishAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new TwofishSerpent ()));
+-
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESBlowfish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESBlowfishSerpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Blowfish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Cast5 ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new TripleDES ()));
+-
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeXTS ()));
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeLRW ()));
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeCBC ()));
+ 	}
+ 
+ 	uint64 VolumeLayoutV1Hidden::GetDataOffset (uint64 volumeHostSize) const
+@@ -140,13 +98,6 @@ namespace TrueCrypt
+ 		BackupHeaderOffset = -TC_VOLUME_HEADER_GROUP_SIZE;
+ 
+ 		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Serpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Twofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofishSerpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentTwofishAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new TwofishSerpent ()));
+ 
+ 		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeXTS ()));
+ 	}
+@@ -176,17 +127,6 @@ namespace TrueCrypt
+ 		HeaderOffset = TC_HIDDEN_VOLUME_HEADER_OFFSET;
+ 		HeaderSize = TC_VOLUME_HEADER_SIZE;
+ 		BackupHeaderOffset = -TC_HIDDEN_VOLUME_HEADER_OFFSET;
+-
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Serpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Twofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofishSerpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentTwofishAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new TwofishSerpent ()));
+-
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeXTS ()));
+ 	}
+ 
+ 	uint64 VolumeLayoutV2Hidden::GetDataOffset (uint64 volumeHostSize) const
+@@ -221,17 +161,6 @@ namespace TrueCrypt
+ 		Type = VolumeType::Normal;
+ 		HeaderOffset = TC_BOOT_VOLUME_HEADER_SECTOR_OFFSET;
+ 		HeaderSize = TC_BOOT_ENCRYPTION_VOLUME_HEADER_SIZE;
+-
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Serpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new Twofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofish ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new AESTwofishSerpent ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new SerpentTwofishAES ()));
+-		SupportedEncryptionAlgorithms.push_back (shared_ptr <EncryptionAlgorithm> (new TwofishSerpent ()));
+-
+-		SupportedEncryptionModes.push_back (shared_ptr <EncryptionMode> (new EncryptionModeXTS ()));
+ 	}
+ 
+ 	uint64 VolumeLayoutSystemEncryption::GetDataOffset (uint64 volumeHostSize) const
